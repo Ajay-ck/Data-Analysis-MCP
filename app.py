@@ -682,20 +682,66 @@ def internal_error(error):
     logger.error(f"Unhandled internal server error: {error}", exc_info=True)
     return jsonify({'success': False, 'error': 'Internal server error'}), 500
 
+# ... (all your existing code above) ...
+
+# --- Gunicorn/Production Initialization ---
+# This block will run when Gunicorn imports the module.
+# We only want this to run if not in direct `python your_script.py` mode,
+# or more precisely, we want it to run for Gunicorn.
+# A simple way is to place it outside `if __name__ == '__main__':`
+# and ensure it only runs once.
+
+_app_initialized_for_gunicorn = False
+
+def ensure_services_started_for_gunicorn():
+    global _app_initialized_for_gunicorn, initialization_successful
+    if not _app_initialized_for_gunicorn:
+        logger.info("Gunicorn/WSGI: Initializing application background services...")
+        if start_background_services(): # This sets initialization_successful
+            logger.info("Gunicorn/WSGI: Background services and MCP components initialized successfully.")
+            import atexit
+            atexit.register(stop_background_services) # Register cleanup for when Gunicorn exits
+        else:
+            logger.critical("Gunicorn/WSGI: Failed to initialize application background services. Application may not function correctly.")
+            # Optionally, raise an error to prevent Gunicorn from starting workers if init fails badly
+            # raise RuntimeError("Critical background service initialization failed.")
+        _app_initialized_for_gunicorn = True
+    return initialization_successful
+
+
+# Ensure services are started when the module is loaded by Gunicorn (due to --preload)
+# The `app` object is created before this, so Flask routes are defined.
+# This call makes sure our background services are up.
+if os.getenv("APP_ENV") == "production" or not __name__ == '__main__': # Heuristic for Gunicorn environment
+    ensure_services_started_for_gunicorn()
+
+
 if __name__ == '__main__':
-    logger.info("Starting application initialization...")
-    if start_background_services():
-        logger.info("Background services and MCP components initialized successfully.")
-        logger.info("Starting Flask development server on http://0.0.0.0:5000")
-        try:
-            app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
-        except KeyboardInterrupt:
-            logger.info("Flask server shutting down (KeyboardInterrupt)...")
-        finally:
-            logger.info("Flask app has exited. Cleaning up background services.")
-            stop_background_services()
-            logger.info("Application shutdown complete.")
-    else:
-        logger.error("Failed to initialize application background services. Exiting.")
-        stop_background_services() # Attempt cleanup even on failure
+    logger.info("Direct Run: Initializing application background services...")
+    # For direct run, `ensure_services_started_for_gunicorn` might have already run if APP_ENV is set.
+    # `start_background_services` itself has internal checks to prevent multiple inits of components.
+    # So, calling it here is fine, it will just ensure `initialization_successful` is set for direct run.
+    if not _app_initialized_for_gunicorn: # If Gunicorn path didn't run
+        if start_background_services():
+            logger.info("Direct Run: Background services and MCP components initialized successfully.")
+            import atexit
+            atexit.register(stop_background_services)
+        else:
+            logger.error("Direct Run: Failed to initialize application background services. Exiting.")
+            stop_background_services() # Attempt cleanup
+            exit(1)
+    elif not initialization_successful: # Gunicorn path ran but failed
+        logger.error("Direct Run: Background services failed to initialize via Gunicorn path. Exiting.")
         exit(1)
+
+
+    logger.info("Starting Flask development server on http://0.0.0.0:5000")
+    try:
+        # threaded=True is not strictly necessary here as Flask dev server is single process,
+        # but doesn't hurt. Gunicorn will handle true concurrency.
+        app.run(host='0.0.0.0', port=5000, debug=False)
+    except KeyboardInterrupt:
+        logger.info("Flask server (direct run) shutting down (KeyboardInterrupt)...")
+    finally:
+        logger.info("Flask app (direct run) has exited. Cleanup (if registered by atexit) will occur.")
+        # atexit handles stop_background_services
