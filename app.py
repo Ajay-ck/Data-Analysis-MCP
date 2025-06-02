@@ -1,6 +1,8 @@
 import asyncio
 import os
 import json
+import signal
+import sys
 from urllib.parse import quote_plus, urlparse
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -10,6 +12,12 @@ from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 import threading
+from concurrent.futures import ThreadPoolExecutor
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -36,6 +44,9 @@ server_params = StdioServerParameters(
 )
 
 model = ChatOpenAI(model_name="gpt-4o", openai_api_key=openai_api_key)
+
+# Thread pool for handling async operations
+executor = ThreadPoolExecutor(max_workers=2)
 
 class DataStructureHandler:
     """Simple handler for formatting MCP results"""
@@ -76,63 +87,127 @@ class DataStructureHandler:
 async def process_mcp_query(query):
     """Process database query through MCP and return results"""
     try:
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                tools = await load_mcp_tools(session)
-                agent = create_react_agent(model, tools)
+        logger.info(f"Processing query: {query[:100]}...")
+        
+        # Set shorter timeout for MCP operations
+        async with asyncio.timeout(30):  # 30 second timeout
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools = await load_mcp_tools(session)
+                    agent = create_react_agent(model, tools)
 
-                # Enhanced prompt for database queries
-                prompt = f"""You are a PostgreSQL database assistant. Follow these instructions:
+                    # Enhanced prompt for database queries
+                    prompt = f"""You are a PostgreSQL database assistant. Follow these instructions:
 1. Begin by exploring the database schema using list_tables and describe_table tools
 2. Analyze the user's query to understand what data they need
 3. Write appropriate SQL queries using the query tool
 4. Always use explicit JOINs and proper WHERE clauses
-5. Limit results to 100 rows maximum
+5. Limit results to 50 rows maximum (keep it small for faster responses)
 6. For sales/invoice queries, apply appropriate state filters (e.g., state = 'sale' for completed sales)
 
 User question: {query}"""
 
-                # Execute the query through the agent
-                agent_response = await agent.ainvoke({"messages": prompt})
-                messages = agent_response["messages"]
+                    # Execute the query through the agent
+                    agent_response = await agent.ainvoke({"messages": prompt})
+                    messages = agent_response["messages"]
 
-                tool_results = []
-                handler = DataStructureHandler()
-                
-                # Process all tool responses
-                for msg in messages:
-                    if msg.type == "tool":
-                        tool_name = getattr(msg, "name", "unknown_tool")
-                        parsed_content = handler.parse_tool_content(msg.content)
-                        formatted_content = handler.format_query_results(parsed_content)
-                        
-                        tool_results.append({
-                            "tool": tool_name,
-                            "result": formatted_content
-                        })
+                    tool_results = []
+                    handler = DataStructureHandler()
+                    
+                    # Process all tool responses
+                    for msg in messages:
+                        if msg.type == "tool":
+                            tool_name = getattr(msg, "name", "unknown_tool")
+                            parsed_content = handler.parse_tool_content(msg.content)
+                            formatted_content = handler.format_query_results(parsed_content)
+                            
+                            tool_results.append({
+                                "tool": tool_name,
+                                "result": formatted_content
+                            })
 
-                return {
-                    "success": True,
-                    "query": query,
-                    "results": tool_results
-                }
+                    logger.info(f"Query completed successfully, {len(tool_results)} results")
+                    return {
+                        "success": True,
+                        "query": query,
+                        "results": tool_results
+                    }
 
+    except asyncio.TimeoutError:
+        logger.error(f"Query timed out: {query[:100]}")
+        return {
+            "success": False,
+            "query": query,
+            "error": "Query timed out (30s limit exceeded)"
+        }
     except Exception as e:
+        logger.error(f"Error processing query: {str(e)}")
         return {
             "success": False,
             "query": query,
             "error": str(e)
         }
 
-def run_async_query(query):
-    """Run async query in new event loop for Flask thread"""
+def run_async_query_safe(query):
+    """Safely run async query with proper event loop handling"""
+    try:
+        # Check if there's already an event loop in this thread
+        try:
+            loop = asyncio.get_running_loop()
+            # If we're in an async context, we need to use a different approach
+            logger.warning("Already in async context, using thread executor")
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(run_in_new_loop, query)
+                return future.result(timeout=45)  # 45 second timeout
+        except RuntimeError:
+            # No event loop running, safe to create one
+            return run_in_new_loop(query)
+            
+    except Exception as e:
+        logger.error(f"Error in run_async_query_safe: {str(e)}")
+        return {
+            "success": False,
+            "query": query,
+            "error": f"Query execution error: {str(e)}"
+        }
+
+def run_in_new_loop(query):
+    """Run query in a new event loop"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(process_mcp_query(query))
     finally:
-        loop.close()
+        try:
+            # Clean up any pending tasks
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except:
+            pass
+        finally:
+            loop.close()
+
+@app.route('/', methods=['GET'])
+def home():
+    """Home endpoint with API documentation"""
+    return jsonify({
+        "service": "MCP PostgreSQL API",
+        "version": "1.0.0",
+        "endpoints": {
+            "POST /query": "Send database queries",
+            "GET /health": "Health check"
+        },
+        "example": {
+            "url": "/query",
+            "method": "POST",
+            "body": {"query": "How many tables are there?"}
+        }
+    }), 200
 
 @app.route('/query', methods=['POST'])
 def query_database():
@@ -153,8 +228,17 @@ def query_database():
                 "error": "Query cannot be empty"
             }), 400
 
-        # Process the query
-        result = run_async_query(user_query)
+        logger.info(f"Received query request: {user_query[:100]}...")
+
+        # Process the query with timeout
+        try:
+            result = run_async_query_safe(user_query)
+        except Exception as e:
+            logger.error(f"Query processing failed: {str(e)}")
+            return jsonify({
+                "success": False,
+                "error": f"Query processing failed: {str(e)}"
+            }), 500
         
         if result["success"]:
             return jsonify(result), 200
@@ -162,6 +246,7 @@ def query_database():
             return jsonify(result), 500
 
     except Exception as e:
+        logger.error(f"Server error in query_database: {str(e)}")
         return jsonify({
             "success": False,
             "error": f"Server error: {str(e)}"
@@ -172,8 +257,18 @@ def health_check():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy",
-        "service": "MCP PostgreSQL API"
+        "service": "MCP PostgreSQL API",
+        "timestamp": asyncio.get_event_loop().time() if asyncio._get_running_loop() else "N/A"
     }), 200
+
+# Graceful shutdown handling
+def signal_handler(signum, frame):
+    logger.info("Received shutdown signal, cleaning up...")
+    executor.shutdown(wait=True)
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 if __name__ == '__main__':
     print("🚀 Starting Flask MCP API server...")
@@ -187,12 +282,10 @@ if __name__ == '__main__':
         print("🔗 PostgreSQL URL: [URL parsed from DATABASE_URL]")
     
     print("📍 Endpoints:")
+    print("  GET / - API documentation")
     print("  POST /query - Send database queries")
     print("  GET /health - Health check")
     print("\n📋 Example request:")
     print('curl -X POST http://localhost:5000/query -H "Content-Type: application/json" -d \'{"query": "How many tables are there?"}\'\n')
-    print("⚠️  Make sure your .env file includes:")
-    print("   DATABASE_URL=postgresql://user:pass@host:port/db?sslmode=require")
-    print("   (Copy the External Database URL from your Render dashboard)")
     
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)
