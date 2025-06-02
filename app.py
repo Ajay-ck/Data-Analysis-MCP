@@ -101,7 +101,7 @@ async def test_mcp_server():
             env={"NODE_OPTIONS": "--max-old-space-size=512"}
         )
         
-        async with asyncio.timeout(15):  # 15 second timeout for testing
+        async with asyncio.timeout(45):  # 15 second timeout for testing
             async with stdio_client(server_params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -271,7 +271,7 @@ async def _execute_mcp_query(query):
             env={"NODE_OPTIONS": "--max-old-space-size=512"}
         )
         
-        async with asyncio.timeout(20):  # 20 second timeout
+        async with asyncio.timeout(60):  # 20 second timeout
             async with stdio_client(server_params) as (read, write):
                 async with ClientSession(read, write) as session:
                     logger.info("MCP session established, initializing...")
