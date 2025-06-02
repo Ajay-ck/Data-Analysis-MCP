@@ -84,29 +84,6 @@ class DataStructureHandler:
         else:
             return {"type": "string", "data": str(data)}
 
-async def process_mcp_query(query):
-    """Process database query through MCP and return results"""
-    try:
-        logger.info(f"Processing query: {query[:100]}...")
-        
-        # Use asyncio.wait_for for timeout instead of asyncio.timeout
-        return await asyncio.wait_for(_execute_mcp_query(query), timeout=30.0)
-            
-    except asyncio.TimeoutError:
-        logger.error(f"Query timed out: {query[:100]}")
-        return {
-            "success": False,
-            "query": query,
-            "error": "Query timed out (30s limit exceeded)"
-        }
-    except Exception as e:
-        logger.error(f"Error processing query: {str(e)}")
-        return {
-            "success": False,
-            "query": query,
-            "error": str(e)
-        }
-
 async def _execute_mcp_query(query):
     """Execute the actual MCP query"""
     async with stdio_client(server_params) as (read, write):
@@ -152,6 +129,14 @@ User question: {query}"""
                 "results": tool_results
             }
 
+async def process_mcp_query(query):
+    """Process database query through MCP and return results"""
+    try:
+        logger.info(f"Processing query: {query[:100]}...")
+        
+        # Use asyncio.wait_for for timeout
+        return await asyncio.wait_for(_execute_mcp_query(query), timeout=30.0)
+            
     except asyncio.TimeoutError:
         logger.error(f"Query timed out: {query[:100]}")
         return {
