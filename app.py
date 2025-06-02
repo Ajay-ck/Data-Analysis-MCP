@@ -89,16 +89,34 @@ async def process_mcp_query(query):
     try:
         logger.info(f"Processing query: {query[:100]}...")
         
-        # Set shorter timeout for MCP operations
-        async with asyncio.timeout(30):  # 30 second timeout
-            async with stdio_client(server_params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    tools = await load_mcp_tools(session)
-                    agent = create_react_agent(model, tools)
+        # Use asyncio.wait_for for timeout instead of asyncio.timeout
+        return await asyncio.wait_for(_execute_mcp_query(query), timeout=30.0)
+            
+    except asyncio.TimeoutError:
+        logger.error(f"Query timed out: {query[:100]}")
+        return {
+            "success": False,
+            "query": query,
+            "error": "Query timed out (30s limit exceeded)"
+        }
+    except Exception as e:
+        logger.error(f"Error processing query: {str(e)}")
+        return {
+            "success": False,
+            "query": query,
+            "error": str(e)
+        }
 
-                    # Enhanced prompt for database queries
-                    prompt = f"""You are a PostgreSQL database assistant. Follow these instructions:
+async def _execute_mcp_query(query):
+    """Execute the actual MCP query"""
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await load_mcp_tools(session)
+            agent = create_react_agent(model, tools)
+
+            # Enhanced prompt for database queries
+            prompt = f"""You are a PostgreSQL database assistant. Follow these instructions:
 1. Begin by exploring the database schema using list_tables and describe_table tools
 2. Analyze the user's query to understand what data they need
 3. Write appropriate SQL queries using the query tool
@@ -108,31 +126,31 @@ async def process_mcp_query(query):
 
 User question: {query}"""
 
-                    # Execute the query through the agent
-                    agent_response = await agent.ainvoke({"messages": prompt})
-                    messages = agent_response["messages"]
+            # Execute the query through the agent
+            agent_response = await agent.ainvoke({"messages": prompt})
+            messages = agent_response["messages"]
 
-                    tool_results = []
-                    handler = DataStructureHandler()
+            tool_results = []
+            handler = DataStructureHandler()
+            
+            # Process all tool responses
+            for msg in messages:
+                if msg.type == "tool":
+                    tool_name = getattr(msg, "name", "unknown_tool")
+                    parsed_content = handler.parse_tool_content(msg.content)
+                    formatted_content = handler.format_query_results(parsed_content)
                     
-                    # Process all tool responses
-                    for msg in messages:
-                        if msg.type == "tool":
-                            tool_name = getattr(msg, "name", "unknown_tool")
-                            parsed_content = handler.parse_tool_content(msg.content)
-                            formatted_content = handler.format_query_results(parsed_content)
-                            
-                            tool_results.append({
-                                "tool": tool_name,
-                                "result": formatted_content
-                            })
+                    tool_results.append({
+                        "tool": tool_name,
+                        "result": formatted_content
+                    })
 
-                    logger.info(f"Query completed successfully, {len(tool_results)} results")
-                    return {
-                        "success": True,
-                        "query": query,
-                        "results": tool_results
-                    }
+            logger.info(f"Query completed successfully, {len(tool_results)} results")
+            return {
+                "success": True,
+                "query": query,
+                "results": tool_results
+            }
 
     except asyncio.TimeoutError:
         logger.error(f"Query timed out: {query[:100]}")
@@ -257,8 +275,7 @@ def health_check():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy",
-        "service": "MCP PostgreSQL API",
-        "timestamp": asyncio.get_event_loop().time() if asyncio._get_running_loop() else "N/A"
+        "service": "MCP PostgreSQL API"
     }), 200
 
 # Graceful shutdown handling
